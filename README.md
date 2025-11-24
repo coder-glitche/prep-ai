@@ -35,7 +35,27 @@ Prep.AI is a **full-stack voice-based mock interview agent** built with FastAPI,
 
 ### **Voice**
 - STT: Groq Whisper  
-- TTS: Browser SpeechSynthesis API  
+- TTS: Browser SpeechSynthesis API
+
+---
+
+---
+
+# 🔧 Prerequisites
+
+## 2.1 System & Python
+
+**Requirements**
+- Ubuntu 22.04
+- Python 3.10+
+- pip & venv
+
+Install Python tools:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv
+
 
 ---
 
