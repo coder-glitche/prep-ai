@@ -2,6 +2,14 @@
 
 Prep.AI is a full-stack voice-based mock interview agent. This document includes: tech stack, setup, and run instructions for both backend and frontend.
 
+To solve the issue of conversational AI voice agents instead of using readily available APIs or voice agents from ELEVEN LABS or VAPI which are costly 
+Ive built this interviewer voice agent using open - source models like 
+
+- Llama 3.1 - 8b instant model for Natural Language processing, conversation flow , memory and knowledge base handling.
+- OpenAI whispher large turbo for Speech to Text (transcription).
+- Browser SpeechSynthesis for Text to Speech (voice generation).
+
+
 ## Features
 
 It can:
