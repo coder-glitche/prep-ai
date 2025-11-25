@@ -9,6 +9,7 @@ Ive built this interviewer voice agent using open - source models like
 - `OpenAI whispher large turbo v3` - for Speech to Text (transcription).
 - `Browser SpeechSynthesis API` - for Text to Speech (voice generation).
 
+![Project Image](images/ARCHITERCTURE.png)
 
 ## Features
 
