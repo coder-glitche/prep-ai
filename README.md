@@ -12,6 +12,29 @@ Ive built this interviewer voice agent using open - source models like
 ![Project Image](images/ARCHITERCTURE.png)
 
 ## Features
+<table>
+  <tr>
+    <td align="center">
+      <img src="images/home.png" width="300"><br>
+      <b>Home</b>
+    </td>
+    <td align="center">
+      <img src="images/dashboard.png" width="300"><br>
+      <b>Dashboard</b>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="images/deck.png" width="300"><br>
+      <b>interview Deck</b>
+    </td>
+    <td align="center">
+      <img src="images/results.png" width="300"><br>
+      <b>Results</b>
+    </td>
+  </tr>
+</table>
+
 
 It can:
 - Generate 3 role-specific questions (Technical, Project/Resume, Behavioural)
@@ -29,6 +52,8 @@ It can:
   - STT: Groq whisper-large-v3-turbo
   - TTS: Browser SpeechSynthesis API
 - **OS:** Ubuntu 22.04 (developer machine)
+
+
 
 ## Project Structure (Top Level)
 ```
