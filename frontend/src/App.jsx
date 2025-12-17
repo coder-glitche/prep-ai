@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import "./App.css";
-
-const API_BASE = "http://localhost:8000";
+// at top of App.jsx
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 const MAX_FOLLOWUPS_PER_QUESTION = 1;
 const MAX_QUESTION_MINUTES = 10;
