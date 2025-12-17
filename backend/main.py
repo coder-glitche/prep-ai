@@ -32,6 +32,7 @@ app = FastAPI(title="Prep.AI Interview Voice Agent")
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://prep-ai-theta-five.vercel.app",
 ]
 
 app.add_middleware(
