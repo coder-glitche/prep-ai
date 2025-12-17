@@ -41,8 +41,6 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_methods=["*"],   # very important for OPTIONS
-    allow_headers=["*"],   # allow all headers in preflight
 )
 
 RESULTS_FILE = os.path.join(BASE_DIR, "results.csv")
