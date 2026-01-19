@@ -1,12 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
 import "./App.css";
-// at top of App.jsx
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
-const MAX_FOLLOWUPS_PER_QUESTION = 1;
-const MAX_QUESTION_MINUTES = 10;
-const ANSWER_RECORD_MS = 45000; // 45s per answer window
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+const ANSWER_RECORD_MS = 45000;
+
+const TURN = {
+  ASKING: "ASKING",
+  LISTENING: "LISTENING",
+  SUBMITTING: "SUBMITTING",
+  FEEDBACK: "FEEDBACK",
+  DONE: "DONE",
+};
 
 function App() {
   const [roles, setRoles] = useState([]);
@@ -26,66 +31,60 @@ function App() {
   const [interviewStarted, setInterviewStarted] = useState(false);
 
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [currentConversation, setCurrentConversation] = useState([]);
   const [allQA, setAllQA] = useState([]);
 
-  const [agentMessage, setAgentMessage] = useState(
-    "Create an interview to get started."
-  );
+  const [agentMessage, setAgentMessage] = useState("Create an interview to get started.");
   const [userInput, setUserInput] = useState("");
 
   const [scores, setScores] = useState(null);
   const [feedback, setFeedback] = useState(null);
 
-  const [questionStartTime, setQuestionStartTime] = useState(null);
-  const [followupCount, setFollowupCount] = useState(0);
-
   const [isRecording, setIsRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
 
-  const [showTranscript, setShowTranscript] = useState(false);
-
-  const [skipStage, setSkipStage] = useState(0); // 0 = not skipped, 1 = hint already given
+  const [turnState, setTurnState] = useState(TURN.DONE);
 
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
   const recordTimerRef = useRef(null);
+  const activeSubmitTokenRef = useRef(0);
 
   // ---------- helpers ----------
   const speak = (text, onEnd) => {
     if (!window.speechSynthesis) {
-      if (onEnd) onEnd();
+      onEnd && onEnd();
       return;
     }
     const utter = new SpeechSynthesisUtterance(text);
-    utter.onend = () => {
-      if (onEnd) onEnd();
-    };
+    utter.onend = () => onEnd && onEnd();
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utter);
   };
 
-  const resetQuestionState = () => {
-    // wipe "memory" for the next question
-    setCurrentConversation([]);
-    setFollowupCount(0);
-    setQuestionStartTime(null);
-    setSkipStage(0);
-    setUserInput("");
+  const stopAnyRecording = () => {
+    try {
+      if (mediaRecorderRef.current && isRecording) {
+        mediaRecorderRef.current.stop();
+      }
+    } catch {
+      // ignore
+    }
   };
 
   useEffect(() => {
-    axios.get(`${API_BASE}/api/roles`).then((res) => {
-      setRoles(res.data.roles);
-    });
+    axios.get(`${API_BASE}/api/roles`).then((res) => setRoles(res.data.roles));
   }, []);
 
   // ---------- recording ----------
   const startRecording = async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (turnState !== TURN.LISTENING) return;
+    if (isRecording) return;
+
+    if (!navigator.mediaDevices?.getUserMedia) {
       alert("Your browser does not support audio recording.");
       return;
     }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
@@ -93,35 +92,31 @@ function App() {
       setRecordSeconds(0);
 
       mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
+        if (event.data.size > 0) recordedChunksRef.current.push(event.data);
       };
 
       mediaRecorder.onstop = async () => {
         clearInterval(recordTimerRef.current);
         setRecordSeconds(0);
-        const blob = new Blob(recordedChunksRef.current, {
-          type: "audio/webm",
-        });
+
+        const blob = new Blob(recordedChunksRef.current, { type: "audio/webm" });
         stream.getTracks().forEach((t) => t.stop());
         setIsRecording(false);
-        await handleVoiceBlob(blob);
+
+        // Only process if still LISTENING (prevents stale submits)
+        if (turnState !== TURN.LISTENING) return;
+
+        await submitVoiceBlob(blob);
       };
 
       mediaRecorderRef.current = mediaRecorder;
       mediaRecorder.start();
       setIsRecording(true);
 
-      recordTimerRef.current = setInterval(
-        () => setRecordSeconds((s) => s + 1),
-        1000
-      );
+      recordTimerRef.current = setInterval(() => setRecordSeconds((s) => s + 1), 1000);
 
       setTimeout(() => {
-        if (mediaRecorder.state === "recording") {
-          mediaRecorder.stop();
-        }
+        if (mediaRecorder.state === "recording") mediaRecorder.stop();
       }, ANSWER_RECORD_MS);
     } catch (err) {
       console.error("Error accessing mic:", err);
@@ -130,31 +125,183 @@ function App() {
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-    }
+    if (turnState !== TURN.LISTENING) return;
+    if (mediaRecorderRef.current && isRecording) mediaRecorderRef.current.stop();
   };
 
-  const handleVoiceBlob = async (blob) => {
+  // ---------- voice submission ----------
+  const submitVoiceBlob = async (blob) => {
+    if (turnState !== TURN.LISTENING) return;
+
+    setTurnState(TURN.SUBMITTING);
+    activeSubmitTokenRef.current += 1;
+    const token = activeSubmitTokenRef.current;
+
     const formData = new FormData();
     formData.append("file", blob, "answer.webm");
 
     try {
-      const transcribeRes = await axios.post(
-        `${API_BASE}/api/transcribe`,
-        formData,
-        { headers: { "Content-Type": "multipart/form-data" } }
-      );
+      const transcribeRes = await axios.post(`${API_BASE}/api/transcribe`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+
+      if (activeSubmitTokenRef.current !== token) return;
 
       const transcript = (transcribeRes.data.text || "").trim();
       if (!transcript) {
-        alert("I couldn’t understand the audio. Try again or type your answer.");
+        setAgentMessage("I couldn’t catch that. Please answer again (voice or text).");
+        speak("I couldn’t catch that. Please answer again, voice or text.", () => {
+          setTurnState(TURN.LISTENING);
+        });
         return;
       }
-      await handleUserAnswer(transcript);
+
+      await submitSingleAnswer(transcript, { source: "voice" }, token);
     } catch (e) {
       console.error("Transcription error:", e);
-      alert("Transcription failed. Please type your answer.");
+      if (activeSubmitTokenRef.current !== token) return;
+
+      setAgentMessage("Transcription failed. Please type your answer.");
+      speak("Transcription failed. Please type your answer.");
+      setTurnState(TURN.LISTENING);
+    }
+  };
+
+  // ---------- typed submission ----------
+  const handleTextSubmit = async (e) => {
+    e.preventDefault();
+    if (turnState !== TURN.LISTENING) return;
+
+    stopAnyRecording();
+
+    const trimmed = (userInput || "").trim();
+    if (!trimmed) return;
+
+    setTurnState(TURN.SUBMITTING);
+    activeSubmitTokenRef.current += 1;
+    const token = activeSubmitTokenRef.current;
+
+    await submitSingleAnswer(trimmed, { source: "typed" }, token);
+  };
+
+  // ---------- single answer => backend respond => feedback => next question ----------
+  const submitSingleAnswer = async (answerText, meta, token) => {
+    const question = questions[currentIndex];
+    if (!question) {
+      setTurnState(TURN.LISTENING);
+      return;
+    }
+
+    try {
+      const res = await axios.post(`${API_BASE}/api/respond`, {
+        role: selectedRole,
+        question,
+        candidate_answer: answerText,
+      });
+
+      if (activeSubmitTokenRef.current !== token) return;
+
+      const { reply, summary, remarks, score } = res.data;
+
+      const qaItem = {
+        question: question.text,
+        conversation: [
+          { sender: "agent", text: `Question: ${question.text}` },
+          { sender: "candidate", text: answerText },
+          { sender: "agent", text: reply },
+        ],
+        summary,
+        remarks,
+        score,
+        meta,
+      };
+
+      const updatedAllQA = [...allQA, qaItem];
+      setAllQA(updatedAllQA);
+
+      // FEEDBACK lock: no more input until next question
+      setTurnState(TURN.FEEDBACK);
+      setAgentMessage(reply);
+      setUserInput("");
+
+      speak(reply, () => {
+        const next = currentIndex + 1;
+        if (next < questions.length) {
+          askQuestion(next);
+        } else {
+          finishInterview(updatedAllQA);
+        }
+      });
+    } catch (e) {
+      console.error("Respond error:", e);
+      if (activeSubmitTokenRef.current !== token) return;
+
+      setAgentMessage("Backend error. Please try again.");
+      speak("Backend error. Please try again.");
+      setTurnState(TURN.LISTENING);
+    }
+  };
+
+  // ---------- skip: immediate ----------
+  const handleSkipClick = async () => {
+    if (turnState !== TURN.LISTENING) return;
+
+    stopAnyRecording();
+    setTurnState(TURN.SUBMITTING);
+    activeSubmitTokenRef.current += 1;
+    const token = activeSubmitTokenRef.current;
+
+    const question = questions[currentIndex];
+    if (!question) {
+      setTurnState(TURN.LISTENING);
+      return;
+    }
+
+    try {
+      const res = await axios.post(`${API_BASE}/api/skip`, {
+        role: selectedRole,
+        question,
+      });
+
+      if (activeSubmitTokenRef.current !== token) return;
+
+      const { reply, summary, remarks, score } = res.data;
+
+      const qaItem = {
+        question: question.text,
+        conversation: [
+          { sender: "agent", text: `Question: ${question.text}` },
+          { sender: "candidate", text: "[SKIPPED]" },
+          { sender: "agent", text: reply },
+        ],
+        summary,
+        remarks,
+        score,
+        meta: { source: "skip" },
+      };
+
+      const updatedAllQA = [...allQA, qaItem];
+      setAllQA(updatedAllQA);
+
+      setTurnState(TURN.FEEDBACK);
+      setAgentMessage(reply);
+      setUserInput("");
+
+      speak(reply, () => {
+        const next = currentIndex + 1;
+        if (next < questions.length) {
+          askQuestion(next);
+        } else {
+          finishInterview(updatedAllQA);
+        }
+      });
+    } catch (e) {
+      console.error("Skip error:", e);
+      if (activeSubmitTokenRef.current !== token) return;
+
+      setAgentMessage("Skip failed. Please try again.");
+      speak("Skip failed. Please try again.");
+      setTurnState(TURN.LISTENING);
     }
   };
 
@@ -173,18 +320,19 @@ function App() {
 
     setQuestions(res.data.questions);
     setEditingQuestions(res.data.questions.map((q) => ({ ...q })));
+
     setInterviewStarted(false);
     setScores(null);
     setFeedback(null);
     setAllQA([]);
-    resetQuestionState();
 
     setKbResume(resumeText);
     setKbTopics(topicsText);
+
     setAgentMessage("Review and tweak the questions, then start the interview.");
+    setTurnState(TURN.DONE);
   };
 
-  // ---------- start / ask question ----------
   const startInterview = () => {
     if (editingQuestions.length !== 3) {
       alert("You must have exactly 3 questions.");
@@ -199,185 +347,22 @@ function App() {
   };
 
   const askQuestion = (index) => {
+    // invalidate any in-flight submits
+    activeSubmitTokenRef.current += 1;
+
+    setCurrentIndex(index);
     const q = editingQuestions[index];
     if (!q) return;
 
-    resetQuestionState(); // clear any previous conversation/followups
-
-    setCurrentIndex(index);
     const msg = `Question ${index + 1} of 3: ${q.text}`;
     setAgentMessage(msg);
-    const newConv = [{ sender: "agent", text: msg }];
-    setCurrentConversation(newConv);
-    setQuestionStartTime(Date.now());
-
-    speak(msg, () => {
-      startRecording();
-    });
-  };
-
-  // ---------- candidate answer ----------
-  const handleUserAnswer = async (textFromUser) => {
-    const trimmed = (textFromUser || "").trim();
-    if (!trimmed) return;
-
-    const question = questions[currentIndex];
-    if (!question) return;
-
-    const baseConv = [
-      ...currentConversation,
-      { sender: "candidate", text: trimmed },
-    ];
-    setCurrentConversation(baseConv);
-
-    const elapsedMinutes =
-      questionStartTime != null
-        ? (Date.now() - questionStartTime) / (1000 * 60)
-        : 0;
-
-    const res = await axios.post(`${API_BASE}/api/answer`, {
-      role: selectedRole,
-      question,
-      conversation: baseConv,
-      followup_count: followupCount,
-      elapsed_minutes: elapsedMinutes,
-    });
-
-    const { reply, done } = res.data;
-
-    const convWithAgent = [...baseConv, { sender: "agent", text: reply }];
-    setCurrentConversation(convWithAgent);
-    setAgentMessage(reply);
-
-    const newFollowupCount = followupCount + 1;
-    setFollowupCount(newFollowupCount);
-
-    const forcedDone =
-      done ||
-      elapsedMinutes >= MAX_QUESTION_MINUTES ||
-      newFollowupCount >= MAX_FOLLOWUPS_PER_QUESTION;
-
-    // Build QA snapshot for THIS question only
-    const qaBase = {
-      question: question.text,
-      conversation: convWithAgent,
-    };
-
-    if (forcedDone) {
-      // Summarize + score this single question, then wipe memory
-      let qaWithSummary = qaBase;
-      try {
-        const sumRes = await axios.post(`${API_BASE}/api/summarize-answer`, {
-          role: selectedRole,
-          question: question.text,
-          conversation: convWithAgent,
-        });
-        qaWithSummary = {
-          ...qaBase,
-          summary: sumRes.data.summary,
-          remarks: sumRes.data.remarks,
-          score: sumRes.data.score,
-        };
-      } catch (e) {
-        console.error("Summarize error:", e);
-      }
-
-      const updatedAllQA = [...allQA, qaWithSummary];
-      setAllQA(updatedAllQA);
-
-      // hard-reset per-question state BEFORE going to next one
-      resetQuestionState();
-
-      speak(reply, () => {
-        if (currentIndex + 1 < questions.length) {
-          askQuestion(currentIndex + 1);
-        } else {
-          finishInterview(updatedAllQA);
-        }
-      });
-    } else {
-      speak(reply, () => {
-        startRecording();
-      });
-    }
-
     setUserInput("");
-  };
 
-  const handleTextSubmit = (e) => {
-    e.preventDefault();
-    handleUserAnswer(userInput);
-  };
-
-  // ---------- skip flow ----------
-  const handleSkipClick = async () => {
-    stopRecording();
-
-    const question = questions[currentIndex];
-    if (!question) return;
-
-    try {
-      const res = await axios.post(`${API_BASE}/api/skip-question`, {
-        role: selectedRole,
-        question,
-        conversation: currentConversation,
-        attempt: skipStage,
-      });
-
-      const { reply, done } = res.data;
-      const convWithAgent = [
-        ...currentConversation,
-        { sender: "agent", text: reply },
-      ];
-      setCurrentConversation(convWithAgent);
-      setAgentMessage(reply);
-
-      if (!done) {
-        // first skip: hint, same question continues
-        setSkipStage(1);
-        speak(reply, () => {
-          startRecording();
-        });
-      } else {
-        // confirmed skip: treat as completed question (with low score)
-        const qaBase = {
-          question: question.text,
-          conversation: convWithAgent,
-        };
-        let qaWithSummary = qaBase;
-        try {
-          const sumRes = await axios.post(`${API_BASE}/api/summarize-answer`, {
-            role: selectedRole,
-            question: question.text,
-            conversation: convWithAgent,
-          });
-          qaWithSummary = {
-            ...qaBase,
-            summary: sumRes.data.summary,
-            remarks: sumRes.data.remarks,
-            score: sumRes.data.score,
-          };
-        } catch (e) {
-          console.error("Summarize error (skip):", e);
-        }
-
-        const updatedAllQA = [...allQA, qaWithSummary];
-        setAllQA(updatedAllQA);
-
-        // wipe memory for next question
-        resetQuestionState();
-
-        speak(reply, () => {
-          if (currentIndex + 1 < questions.length) {
-            askQuestion(currentIndex + 1);
-          } else {
-            finishInterview(updatedAllQA);
-          }
-        });
-      }
-    } catch (e) {
-      console.error("Skip error:", e);
-    }
+    setTurnState(TURN.ASKING);
+    speak(msg, () => {
+      // Now LISTENING: user can type OR start recording manually
+      setTurnState(TURN.LISTENING);
+    });
   };
 
   // ---------- evaluation ----------
@@ -399,16 +384,17 @@ function App() {
         feedback: evalRes.data.feedback,
       });
 
-      setAgentMessage(
-        "Interview completed. Review your scores and feedback on the right."
-      );
-      speak(
-        "Thanks for completing the mock interview. I have generated your scores and feedback."
-      );
+      setAgentMessage("Interview completed. Review your scores and feedback.");
+      speak("Thanks for completing the mock interview. I have generated your scores and feedback.");
+
       setInterviewStarted(false);
-      resetQuestionState();
+      setTurnState(TURN.DONE);
     } catch (err) {
-      console.error("Error in finishInterview:", err);
+      console.error("finishInterview error:", err);
+      setAgentMessage("Interview completed, but evaluation failed.");
+      speak("Interview completed, but evaluation failed.");
+      setInterviewStarted(false);
+      setTurnState(TURN.DONE);
     }
   };
 
@@ -447,12 +433,16 @@ function App() {
     return `${mm}:${ss}`;
   };
 
-  const currentRoleName =
-    roles.find((r) => r.id === selectedRole)?.name || "No role selected";
+  const currentRoleName = roles.find((r) => r.id === selectedRole)?.name || "No role selected";
+
+  const canInteract = turnState === TURN.LISTENING;
+  const canSkip = canInteract && !isRecording;
+  const canTypeSend = canInteract && !isRecording;
+  const canStartRecord = canInteract && !isRecording;
+  const canStopSend = canInteract && isRecording;
 
   return (
     <div className="app-shell">
-      {/* Sidebar */}
       <aside className="sidebar">
         <div className="sidebar-logo">
           <div className="logo-dot" />
@@ -488,9 +478,7 @@ function App() {
         </div>
       </aside>
 
-      {/* Main content */}
       <main className="main">
-        {/* Top bar */}
         <header className="topbar">
           <div className="topbar-title">
             <span className="topbar-breadcrumb">Dashboard /</span>
@@ -502,15 +490,13 @@ function App() {
         </header>
 
         <div className="content-grid">
-          {/* Left column */}
           <section className="column-left">
             {!interviewStarted && !scores && (
               <div className="card card-config">
                 <div className="card-header">
                   <h2>Create an Interview</h2>
                   <p className="card-subtitle">
-                    Define the role, give a resume + topics, and auto-generate
-                    structured questions.
+                    Define the role, give a resume + topics, and auto-generate 3 questions.
                   </p>
                 </div>
 
@@ -537,9 +523,7 @@ function App() {
                       <input
                         type="file"
                         accept="application/pdf"
-                        onChange={(e) =>
-                          setResumeFile(e.target.files?.[0] || null)
-                        }
+                        onChange={(e) => setResumeFile(e.target.files?.[0] || null)}
                       />
                       <button
                         type="button"
@@ -547,9 +531,7 @@ function App() {
                         onClick={handleResumeUpload}
                         disabled={!resumeFile || isSummarizingResume}
                       >
-                        {isSummarizingResume
-                          ? "Summarizing…"
-                          : "Extract & Summarize"}
+                        {isSummarizingResume ? "Summarizing…" : "Extract & Summarize"}
                       </button>
                     </div>
                     <p className="hint-text">
@@ -571,7 +553,7 @@ function App() {
                     <label className="field-label">Technical Topics</label>
                     <textarea
                       className="field-input field-textarea"
-                      placeholder="e.g. Arrays, DP, REST APIs, system design basics, sales pipeline, objection handling…"
+                      placeholder="e.g. Arrays, DP, REST APIs, system design basics..."
                       value={topicsText}
                       onChange={(e) => setTopicsText(e.target.value)}
                     />
@@ -582,9 +564,6 @@ function App() {
                   <button className="btn-primary" onClick={generateQuestions}>
                     Generate 3 Questions
                   </button>
-                  <span className="hint-text">
-                    You can tweak the questions before starting the interview.
-                  </span>
                 </div>
               </div>
             )}
@@ -593,21 +572,15 @@ function App() {
               <div className="card card-questions">
                 <div className="card-header">
                   <h2>Question Set</h2>
-                  <p className="card-subtitle">
-                    Review depth and phrasing before the interview begins.
-                  </p>
+                  <p className="card-subtitle">You can edit the questions before starting.</p>
                 </div>
 
                 <div className="question-list">
                   {editingQuestions.map((q, idx) => (
                     <div key={q.id} className="question-item">
                       <div className="question-header">
-                        <span className="question-label">
-                          Question {idx + 1}
-                        </span>
-                        <span className={`type-pill type-${q.type}`}>
-                          {q.type}
-                        </span>
+                        <span className="question-label">Question {idx + 1}</span>
+                        <span className={`type-pill type-${q.type}`}>{q.type}</span>
                       </div>
                       <textarea
                         className="field-input field-textarea"
@@ -624,7 +597,7 @@ function App() {
 
                 <div className="config-actions">
                   <button className="btn-primary" onClick={startInterview}>
-                    Start Voice Interview
+                    Start Interview
                   </button>
                 </div>
               </div>
@@ -634,25 +607,19 @@ function App() {
               <div className="card card-interview">
                 <div className="interview-header">
                   <div>
-                    <h2 className="interview-title">
-                      Mock {currentRoleName} Interview
-                    </h2>
+                    <h2 className="interview-title">Mock {currentRoleName} Interview</h2>
                     <p className="interview-subtitle">
-                      Expected duration: <strong>10 mins or less</strong>
+                      One answer per question. One feedback. Then next question.
                     </p>
                   </div>
                   <div className="interview-progress">
                     <div className="progress-bar">
                       <div
                         className="progress-fill"
-                        style={{
-                          width: `${((currentIndex + 1) / 3) * 100}%`,
-                        }}
+                        style={{ width: `${((currentIndex + 1) / 3) * 100}%` }}
                       />
                     </div>
-                    <span className="progress-text">
-                      Question {currentIndex + 1} of 3
-                    </span>
+                    <span className="progress-text">Question {currentIndex + 1} of 3</span>
                   </div>
                 </div>
 
@@ -667,19 +634,18 @@ function App() {
                     <div className="avatar-circle avatar-you">You</div>
                     <div className="panel-label">You</div>
                     <p className="candidate-hint">
-                      Speak your answer. When you’re done, hit{" "}
-                      <strong>Stop &amp; Send</strong>. You can also type
-                      below.
+                      Answer by typing, or click <strong>Start Recording</strong> and then <strong>Stop &amp; Send</strong>.
                     </p>
 
                     <form onSubmit={handleTextSubmit}>
                       <textarea
                         className="field-input field-textarea"
-                        placeholder="Fallback: type your answer here if voice fails or you prefer typing."
+                        placeholder="Type your answer here (one submission per question)."
                         value={userInput}
                         onChange={(e) => setUserInput(e.target.value)}
+                        disabled={!canTypeSend}
                       />
-                      <button type="submit" className="btn-secondary">
+                      <button type="submit" className="btn-secondary" disabled={!canTypeSend}>
                         Send Typed Answer
                       </button>
                     </form>
@@ -688,75 +654,39 @@ function App() {
 
                 <div className="interview-footer">
                   <div className="record-widget">
-                    <div
-                      className={`record-dot ${
-                        isRecording ? "record-dot-on" : ""
-                      }`}
-                    />
+                    <div className={`record-dot ${isRecording ? "record-dot-on" : ""}`} />
                     <span className="record-time">
-                      {isRecording ? "Recording" : "Idle"} •{" "}
-                      {formatSeconds(recordSeconds)}
+                      {isRecording ? "Recording" : turnState} • {formatSeconds(recordSeconds)}
                     </span>
-                    <button
-                      className="btn-record"
-                      onClick={stopRecording}
-                      disabled={!isRecording}
-                    >
+
+                    <button className="btn-record" onClick={startRecording} disabled={!canStartRecord}>
+                      ⏺ Start Recording
+                    </button>
+                    <button className="btn-record" onClick={stopRecording} disabled={!canStopSend}>
                       ⏹ Stop &amp; Send
                     </button>
                   </div>
 
                   <div className="footer-actions">
-                    <button
-                      className="btn-secondary"
-                      type="button"
-                      onClick={handleSkipClick}
-                    >
-                      {skipStage === 0 ? "Skip Question" : "Skip Anyway"}
-                    </button>
-                    <button
-                      className="btn-ghost"
-                      type="button"
-                      onClick={() => setShowTranscript((v) => !v)}
-                    >
-                      {showTranscript ? "Hide transcript" : "Show transcript"}
+                    <button className="btn-secondary" type="button" onClick={handleSkipClick} disabled={!canSkip}>
+                      Skip
                     </button>
                   </div>
                 </div>
-
-                {showTranscript && (
-                  <div className="transcript-panel">
-                    {currentConversation.map((m, i) => (
-                      <div key={i} className="transcript-line">
-                        <span className="transcript-speaker">
-                          {m.sender === "agent" ? "Agent" : "You"}:
-                        </span>
-                        <span>{m.text}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             )}
           </section>
 
-          {/* Right column */}
           <section className="column-right">
             <div className="card card-summary">
               <div className="card-header">
                 <h2>Session Overview</h2>
-                <p className="card-subtitle">
-                  High-level summary, scores and qualitative feedback.
-                </p>
+                <p className="card-subtitle">Final scores and feedback after completion.</p>
               </div>
 
               {!scores && (
                 <div className="empty-state">
-                  <p>
-                    Run an interview to see scores, strengths and areas to
-                    improve. Your conversation is automatically analyzed once
-                    all questions are complete.
-                  </p>
+                  <p>Complete the 3 questions to generate a consolidated evaluation.</p>
                 </div>
               )}
 
@@ -765,9 +695,7 @@ function App() {
                   <div className="score-grid">
                     <div className="score-card">
                       <div className="score-ring">
-                        <div className="score-ring-inner">
-                          {Math.round(scores.overall)}
-                        </div>
+                        <div className="score-ring-inner">{Math.round(scores.overall)}</div>
                       </div>
                       <div className="score-label">Overall Hiring Score</div>
                       <p className="score-text">{feedback.summary}</p>
@@ -775,27 +703,18 @@ function App() {
 
                     <div className="score-card">
                       <div className="score-ring small-ring">
-                        <div className="score-ring-inner">
-                          {scores.communication.toFixed(1)}
-                        </div>
+                        <div className="score-ring-inner">{scores.communication.toFixed(1)}</div>
                       </div>
                       <div className="score-label">Communication</div>
-                      <p className="score-text">
-                        {feedback.strengths[0] || "Strong communication."}
-                      </p>
+                      <p className="score-text">{feedback.strengths?.[0] || "—"}</p>
                     </div>
 
                     <div className="score-card">
                       <div className="score-ring small-ring">
-                        <div className="score-ring-inner">
-                          {scores.technical.toFixed(1)}
-                        </div>
+                        <div className="score-ring-inner">{scores.technical.toFixed(1)}</div>
                       </div>
                       <div className="score-label">Technical Depth</div>
-                      <p className="score-text">
-                        {feedback.improvements[0] ||
-                          "Review core concepts for deeper coverage."}
-                      </p>
+                      <p className="score-text">{feedback.improvements?.[0] || "—"}</p>
                     </div>
                   </div>
 
@@ -803,7 +722,7 @@ function App() {
                     <div className="detail-card">
                       <h3>Strengths</h3>
                       <ul>
-                        {feedback.strengths.map((s, i) => (
+                        {(feedback.strengths || []).map((s, i) => (
                           <li key={i}>{s}</li>
                         ))}
                       </ul>
@@ -811,7 +730,7 @@ function App() {
                     <div className="detail-card">
                       <h3>Areas to Improve</h3>
                       <ul>
-                        {feedback.improvements.map((s, i) => (
+                        {(feedback.improvements || []).map((s, i) => (
                           <li key={i}>{s}</li>
                         ))}
                       </ul>
@@ -832,3 +751,4 @@ function App() {
 }
 
 export default App;
+
